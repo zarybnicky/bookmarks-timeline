@@ -3,31 +3,27 @@ Inspired by <https://github.com/andrewp-as-is/chrome-bookmarks.py>
 '''
 
 from datetime import datetime, timedelta
+import io
 import json
+import urllib.parse as parse
 import os
 
+import altair as alt
 from fuzzywuzzy import fuzz
 import pandas as pd
 import numpy as np
 import streamlit as st
 
 
-def process_bookmarks(data: dict):
-    urls = []
-    folders = []
-    for value in data["roots"].values():
-        if "children" in value:
-            processTree(urls, folders, value["children"])
-    return pd.DataFrame(urls)
-
-
-def processTree(urls, folders, children):
-    for item in children:
-        if "type" in item and item["type"] == "url":
+def visit_tree(urls, folder):
+    for item in folder['children']:
+        item_type = item.get('type')
+        if item_type == "url":
             url = {
                 'id': item['id'],
                 'name': item['name'],
                 'url': item['url'],
+                'folder': folder['name'],
                 'date_added': item['date_added'],
                 'last_visited': item.get('date_last_used') or item.get("meta_info", {}).get('last_visited_desktop') or item.get("meta_info", {}).get('last_visited'),
             }
@@ -38,31 +34,135 @@ def processTree(urls, folders, children):
             url["date_added"] = datetime(1601, 1, 1) + timedelta(microseconds=int(url["date_added"]))
             urls.append(url)
 
-        if "type" in item and item["type"] == "folder":
-            folders.append(item)
-            if "children" in item:
-                processTree(urls, folders, item["children"])
+        elif item_type == "folder":
+            visit_tree(urls, item)
 
 
-def is_same(user_1, user_2):
-    return fuzz.partial_ratio(user_1['name'], user_2['name']) > 90
-
-
-def main():
+@st.cache_data
+def get_bookmarks():
     path = os.path.expanduser("~/.config/google-chrome/Default/Bookmarks")
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-        df = process_bookmarks(data)
+        urls = []
+        for folder in data["roots"].values():
+            visit_tree(urls, folder)
+        return pd.DataFrame(urls)
+
+
+def main():
+    st.set_page_config(layout='wide')
+    df = get_bookmarks()
 
     df.set_index(['date_added'], inplace=True, drop=False)
     df.sort_index(inplace=True, ascending=True)
-    df: pd.DataFrame = df.loc[~df['url'].str.contains('youtube.com')]
 
-    st.write(df.loc['2022-12-31':'2023-12-31'])
+    def simplify_url(url):
+        scheme, netloc, path, params, query, fragment = parse.urlparse(url)
+
+        netloc = netloc.removeprefix('en.')
+        netloc = netloc.removeprefix('old.')
+        netloc = netloc.removeprefix('blog.')
+        netloc = netloc.removeprefix('gist.')
+        netloc = netloc.removeprefix('www.')
+        netloc = netloc.removeprefix('m.')
+        netloc = netloc.removeprefix('mobile.')
+        if netloc == 'greaterwrong.com':
+            return 'lesswrong.com'
+        if netloc == 'reddit.com':
+            path = path.replace('//', '/')
+            netloc = 'reddit.com' + '/'.join(path.split('/')[:3])
+        return netloc
+    df['site'] = df['url'].apply(simplify_url)
+
+    def categorize(site):
+        if site == 'youtube.com':
+            return 'YouTube'
+        if site in ['reddit.com/r/WormFanfic', 'reddit.com/r/HPfanfiction', 'alternatehistory.com', 'fiction.live', 'scribblehub.com', 'forum.questionablequesting.com', 'forums.sufficientvelocity.com', 'forums.spacebattles.com', 'royalroad.com', 'fanfiction.net', 'archiveofourown.org']:
+            return 'Fanfic'
+        if site in ['reddit.com/r/Progressivegrowth2', 'alwaysolder.com', 'reddit.com/r/ThickTV', 'reddit.com/r/nsfwcyoa', 'reddit.com/r/UNBGBBIIVCHIDCTIICBG', 'literotica.com', 'writing.com', 'reddit.com/r/BreastExpansion', 'tgstorytime.com', 'tfgames.site', 'deviantart.com', 'girlswithmuscle.com', 'fapello.com', 'chyoa.com', 'f95zone.to', 'mcstories.com']:
+            return 'Girls'
+        if site in ['ultimate-guitar.com', 'pdfminstrel.files.wordpress.com', 'plihal.wz.cz', 'pisnicky-akordy.cz', 'tabs.ultimate-guitar.com', 'jazzguitar.be', 'classicalguitarshed.com']:
+            return 'Guitar'
+        if site in ['github.com']:
+            return 'Code'
+        if site in ['commoncog.com', 'forum.commoncog.com', 'cutlefish.substack.com', 'training.kalzumeus.com']:
+            return 'Business'
+        if site in ['every.to', 'fortelabs.co']:
+            return 'Productivity'
+        if site in ['reddit.com/r/maybemaybemaybe', 'reddit.com/r/gifsthatkeepongiving', 'reddit.com/r/PraiseTheCameraMan']:
+            return 'Humor'
+        return None
+    df['category'] = df['site'].apply(categorize)
+
+    with st.sidebar:
+        q = st.text_input('Search')
+        df = df[df['url'].str.contains(q) | df['name'].str.contains(q)]
+
+        buf = io.StringIO()
+        df.info(buf=buf)
+        st.text(buf.getvalue())
+    st.write(df)
 
     by_added = df['date_added'].resample('M').count().rename('added')
-    by_visited = df['last_visited'].resample('M').count()
-    st.bar_chart(pd.concat([by_added, - by_visited], axis=1))
+    by_visited = df['last_visited'].resample('M').count().rename('visited')
+    combined = pd.concat([by_added, by_visited], axis=1)
+
+    st.altair_chart(
+        alt.Chart(combined.reset_index()).mark_bar().encode(
+            x=alt.X('date_added:T'),
+            y=alt.Y(alt.repeat("layer"), type="quantitative", stack=False),
+            color=alt.datum(alt.repeat("layer")),
+        ).repeat(
+            layer=['added', 'visited'],
+        ),
+        use_container_width=True
+    )
+
+    last_week = df[df['date_added'] > (datetime.now() - timedelta(days=7))].reset_index(drop=True)
+    st.bar_chart(last_week, x='date_added', y=['site'])
+
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col1:
+        st.dataframe(df['site'].value_counts(dropna=False), use_container_width=True)
+    with col2:
+        st.dataframe(df['folder'].value_counts(dropna=False), use_container_width=True)
+    with col3:
+        st.dataframe(df['category'].value_counts(dropna=False), use_container_width=True)
+
+    st.markdown('## Missing a category')
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.dataframe(df[df['category'].isnull()]['site'].value_counts(), use_container_width=True)
+    with col2:
+        st.dataframe(df[df['category'].isnull()], use_container_width=True)
+
+    per_site = df['site'].value_counts().to_frame().reset_index().nlargest(100, 'count')
+    per_site['label'] = per_site.apply(lambda x: f"{x['site']} ({x['count']})", axis=1)
+    points = alt.Chart(per_site).mark_line().encode(
+        x=alt.X("site:N", sort='-y', axis=alt.Axis(labels=False)),
+        y=alt.Y('count:Q').scale(type='log'),
+    )
+
+    st.altair_chart(
+        points + points.mark_text(
+            align='left',
+            baseline='middle',
+            dx=7,
+            angle=305,
+        ).encode(
+            text='label'
+        ),
+        use_container_width=True
+    )
+
+    per_folder = df['folder'].value_counts().to_frame().reset_index()
+    st.altair_chart(
+        alt.Chart(per_folder).mark_arc(innerRadius=50).encode(
+            theta=alt.Theta("count:Q"),
+            color=alt.Color("folder:N").sort(field='count:Q').scale(scheme="category20"),
+            order="count:Q",
+        )
+    )
 
     # df['real_id'] = find_partitions(df=df, match_func=is_same)
     # df.set_index(['real_id', 'id'], inplace=True)
@@ -72,6 +172,10 @@ def main():
     # df.loc[df['date_added'].between('2018-12-31', '2019-12-31')]
     # print(df['date_added'].groupby([df.date_added.dt.year, df.date_added.dt.month]).agg('count'))
     # print(df.loc[df['last_visited'].isnull()].describe(datetime_is_numeric=True))
+
+
+def is_same(user_1, user_2):
+    return fuzz.partial_ratio(user_1['name'], user_2['name']) > 90
 
 
 def find_partitions(df, match_func, max_size=None, block_by=None):
